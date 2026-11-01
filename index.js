@@ -1,6 +1,6 @@
 import express from 'express'
 import cors from 'cors'
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import 'dotenv/config';
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
@@ -69,8 +69,8 @@ app.get('/joined-events', async (req, res) => {
 
 app.get('/create-event', async (req, res) => {
     const cursor = createEvent.find({});
-    const allCreated = await cursor.toArray();
-    res.send(allCreated);
+    const allCreate = await cursor.toArray();
+    res.send(allCreate);
 })
 
 app.post('/create-event', verifyToken , async (req, res) => {
@@ -79,6 +79,39 @@ app.post('/create-event', verifyToken , async (req, res) => {
     res.send(result);
 
 })
+
+
+app.post("/joined",  verifyToken,  async (req, res) => {
+  const data = req.body;
+  const result = await joinedEvent.insertOne(data);
+  res.send(result);
+});
+
+app.get('/joined', async (req, res) => {
+    const cursor = joinedEvent.find({});
+    const allJoin = await cursor.toArray();
+    res.send(allJoin);
+})
+
+
+app.get("/events/:id", verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const result = await createEvent.findOne({
+    _id: new ObjectId(id),
+  });
+  res.send(result);
+});
+
+
+
+
+app.get('/events', async(req, res) => {
+    const cursor = createEvent.find({});
+    const allCreated = await cursor.toArray();
+    res.send(allCreated)
+})
+
+
 
 app.listen(port, () => {
     console.log(`we are running on port: ${port}`)
