@@ -199,6 +199,55 @@ app.get(
     })
 );
 
+// Public list of people going to an event (used by the event details page).
+app.get(
+    '/events/:id/participants',
+    asyncHandler(async (req, res) => {
+        const id = toObjectId(req.params.id);
+
+        if (!id) {
+            return res.status(400).send({ message: 'Invalid event id.' });
+        }
+
+        const db = await getDb();
+        const joinedEvents = db.collection('joined_events');
+
+        const records = await joinedEvents
+            .find({
+                $or: [
+                    { eventId: req.params.id },
+                    { eventId: id },
+                ],
+            })
+            .sort({ _id: 1 })
+            .project({ username: 1, image: 1, email: 1 })
+            .toArray();
+
+        // Keep one entry per user even if older duplicate join records exist.
+        const seen = new Set();
+        const participants = [];
+
+        for (const record of records) {
+            const key = record.email || String(record._id);
+
+            if (seen.has(key)) continue;
+
+            seen.add(key);
+
+            participants.push({
+                _id: record._id,
+                username: record.username || 'Guest',
+                image: record.image || null,
+            });
+        }
+
+        res.send({
+            registeredCount: participants.length,
+            participants,
+        });
+    })
+);
+
 // Events created by the signed-in user (used by /manage-events).
 app.get(
     '/api/events/my',
