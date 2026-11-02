@@ -288,6 +288,87 @@ app.post(
     })
 );
 
+// Update an event (only the organizer can update it).
+app.put(
+    '/api/events/:id',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const id = toObjectId(req.params.id);
+
+        if (!id) {
+            return res.status(400).send({ message: 'Invalid event id.' });
+        }
+
+        const db = await getDb();
+        const events = db.collection('create_event');
+        const event = await events.findOne({ _id: id });
+
+        if (!event) {
+            return res.status(404).send({ message: 'Event not found.' });
+        }
+
+        const ownerEmail =
+            event.form?.email || event.email || null;
+
+        if (
+            ownerEmail &&
+            req.user?.email &&
+            ownerEmail !== req.user.email
+        ) {
+            return res.status(403).send({
+                message: 'You can only edit your own events.',
+            });
+        }
+
+        const body = req.body || {};
+        const updates = body.form || body;
+        const existingForm = event.form || event.event || {};
+
+        if (
+            updates.title !== undefined &&
+            !String(updates.title).trim()
+        ) {
+            return res
+                .status(400)
+                .send({ message: 'Event title is required.' });
+        }
+
+        const allowedFields = [
+            'title',
+            'description',
+            'eventType',
+            'imageUrl',
+            'location',
+            'eventDate',
+        ];
+
+        const form = { ...existingForm };
+
+        for (const field of allowedFields) {
+            if (updates[field] !== undefined) {
+                form[field] = updates[field];
+            }
+        }
+
+        // Keep the original organizer identity.
+        form.username = existingForm.username || event.username;
+        form.email = existingForm.email || event.email;
+        form.createdAt = existingForm.createdAt || event.createdAt;
+
+        await events.updateOne(
+            { _id: id },
+            { $set: { form, updatedAt: new Date() } }
+        );
+
+        const updated = await events.findOne({ _id: id });
+
+        res.send({
+            success: true,
+            event: updated,
+        });
+    })
+);
+
 // Delete an event (only the organizer can delete it).
 app.delete(
     '/api/events/:id',
