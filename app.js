@@ -1,15 +1,17 @@
-import express from "express";
-import cors from "cors";
-import { MongoClient, ObjectId } from "mongodb";
-import "dotenv/config";
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import express from 'express';
+import cors from 'cors';
+import { MongoClient, ObjectId } from 'mongodb';
+import 'dotenv/config';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const app = express();
 
-// =====================================================
-// DATABASE
-// =====================================================
-
+// ---------------------------------------------------------------------------
+// Database
+// ---------------------------------------------------------------------------
+// The connection is created lazily and cached. On Vercel every cold start must
+// be able to create the client inside the request handler instead of at module
+// load, otherwise one bad/missing env var crashes the whole function.
 let dbPromise;
 
 export function getDb() {
@@ -18,7 +20,7 @@ export function getDb() {
 
         if (!url) {
             return Promise.reject(
-                new Error("MONGODB_URL is missing.")
+                new Error('MONGODB_URL is not set in the environment.')
             );
         }
 
@@ -29,10 +31,12 @@ export function getDb() {
         dbPromise = client
             .connect()
             .then((connectedClient) => {
-                console.log("MongoDB connected successfully!");
-                return connectedClient.db("humanova_data");
+                console.log('You successfully connected to MongoDB!');
+                return connectedClient.db('humanova_data');
             })
             .catch((error) => {
+                // Allow the next request to retry instead of caching a
+                // permanently rejected promise.
                 dbPromise = undefined;
                 throw error;
             });
@@ -41,28 +45,12 @@ export function getDb() {
     return dbPromise;
 }
 
-// =====================================================
-// HELPERS
-// =====================================================
-
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 const asyncHandler = (handler) => (req, res, next) => {
     Promise.resolve(handler(req, res, next)).catch(next);
 };
-
-function toObjectId(id) {
-    return ObjectId.isValid(id)
-        ? new ObjectId(id)
-        : null;
-}
-
-function getTodayInBangladesh() {
-    return new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Dhaka",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-    }).format(new Date());
-}
 
 function flattenEvent(doc) {
     if (!doc) return null;
@@ -72,46 +60,78 @@ function flattenEvent(doc) {
     return {
         ...form,
         _id: doc._id,
-        createdAt: doc.createdAt || form.createdAt,
+        createdAt: doc.createdAt ?? form.createdAt,
     };
 }
 
-// =====================================================
-// MIDDLEWARE
-// =====================================================
+function toObjectId(id) {
+    return ObjectId.isValid(id) ? new ObjectId(id) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+// Allow the deployed frontend to call the API with cookies/credentials.
+// CLIENT_URL can be a single URL or a comma-separated list, and is normalized
+// so a trailing slash in the environment variable does not break CORS.
+const configuredOrigins = (
+    process.env.CLIENT_URL ||
+    process.env.WEB_URL ||
+    process.env.BETTER_AUTH_URL ||
+    'http://localhost:3000'
+)
+    .split(',')
+    .map((origin) => origin.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+
+const localOrigins = ['http://localhost:3000', 'http://localhost:3100'];
 
 app.use(
     cors({
-        origin: [
-            process.env.WEB_URL,
-            process.env.CLIENT_URL,
-            "http://localhost:3000",
-        ].filter(Boolean),
+        origin(origin, callback) {
+            // Requests without an Origin header come from curl or another
+            // server, not a browser. Let them through.
+            if (!origin) return callback(null, true);
+
+            const cleanOrigin = origin.replace(/\/+$/, '');
+
+            if (
+                configuredOrigins.includes(cleanOrigin) ||
+                localOrigins.includes(cleanOrigin)
+            ) {
+                return callback(null, true);
+            }
+
+            // Do not throw: simply omit the CORS headers so the browser blocks
+            // the response, while server-to-server calls still work.
+            return callback(null, false);
+        },
         credentials: true,
     })
 );
+app.use(express.json({ limit: '2mb' }));
 
-app.use(express.json({ limit: "2mb" }));
-
-// =====================================================
-// BETTER AUTH JWT VERIFICATION
-// =====================================================
-
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+// Better Auth exposes the JWKS endpoint on the frontend deployment.
+// Set CLIENT_URL to the deployed frontend URL on Vercel.
 let jwks;
 
 function getJwks() {
     const clientUrl =
-        process.env.CLIENT_URL ||
-        process.env.BETTER_AUTH_URL;
+        process.env.CLIENT_URL || process.env.BETTER_AUTH_URL;
 
     if (!clientUrl) {
-        throw new Error("CLIENT_URL is missing.");
+        throw new Error(
+            'CLIENT_URL (or BETTER_AUTH_URL) is not set in the environment.'
+        );
     }
 
     if (!jwks) {
         jwks = createRemoteJWKSet(
             new URL(
-                `${clientUrl.replace(/\/+$/, "")}/api/auth/jwks`
+                `${clientUrl.replace(/\/+$/, '')}/api/auth/jwks`
             )
         );
     }
@@ -119,496 +139,139 @@ function getJwks() {
     return jwks;
 }
 
-const verifyToken = asyncHandler(async (req, res, next) => {
-    const authorization = req.headers.authorization;
+function readToken(req) {
+    const authHeader = req.headers.authorization;
 
-    if (!authorization?.startsWith("Bearer ")) {
-        return res.status(401).send({
-            message: "Unauthorized!",
-        });
+    if (!authHeader) return null;
+
+    // Accept both "Bearer <token>" and a bare token, because different parts
+    // of the frontend send the token in different formats.
+    return authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : authHeader.trim();
+}
+
+const verifyToken = asyncHandler(async (req, res, next) => {
+    const token = readToken(req);
+
+    if (!token) {
+        return res.status(401).send({ message: 'Unauthorized!' });
     }
 
-    const token = authorization.slice(7).trim();
-
     try {
-        const { payload } = await jwtVerify(
-            token,
-            getJwks()
-        );
-
+        const { payload } = await jwtVerify(token, getJwks());
         req.user = payload;
         next();
     } catch (error) {
-        console.error("JWT verification failed:", error.message);
-
-        return res.status(401).send({
-            message: "Invalid or expired token.",
-        });
+        console.error('Token verification failed:', error.message);
+        return res.status(401).send({ message: 'Unauthorized!' });
     }
 });
 
-// =====================================================
-// HEALTH CHECK
-// =====================================================
-
-app.get("/", (req, res) => {
-    res.status(200).send({
-        success: true,
-        message: "Humanova API is running!",
-    });
+// ---------------------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------------------
+app.get('/', (req, res) => {
+    res.send('welcome to server');
 });
 
-// =====================================================
-// NEWSLETTER
-// =====================================================
-
-const subscribeToNewsletter = asyncHandler(
-    async (req, res) => {
-        const email = String(
-            req.body?.email || ""
-        ).trim().toLowerCase();
-
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-            return res.status(400).send({
-                message: "Please enter a valid email address.",
-            });
-        }
-
-        const db = await getDb();
-        const collection = db.collection(
-            "newsletter_subscribers"
-        );
-
-        const existing = await collection.findOne({ email });
-
-        if (existing) {
-            return res.send({
-                success: true,
-                alreadySubscribed: true,
-                message: "You are already subscribed.",
-            });
-        }
-
-        await collection.insertOne({
-            email,
-            source: String(
-                req.body?.source || "homepage"
-            ).slice(0, 60),
-            createdAt: new Date(),
-        });
-
-        res.status(201).send({
-            success: true,
-            alreadySubscribed: false,
-            message: "Subscribed successfully.",
-        });
-    }
-);
-
-app.post("/newsletter", subscribeToNewsletter);
-app.post("/api/newsletter", subscribeToNewsletter);
-
-// =====================================================
-// UPCOMING EVENTS — ONLY 6
-// =====================================================
-
-const getUpcomingEvents = asyncHandler(
-    async (req, res) => {
-        const db = await getDb();
-
-        const today = getTodayInBangladesh();
-
-        const events = await db
-            .collection("create_event")
-            .find({
-                "form.eventDate": {
-                    $gte: today,
-                },
-            })
-            .sort({
-                "form.eventDate": 1,
-                _id: 1,
-            })
-            .limit(6)
-            .toArray();
-
-        res.status(200).send(events);
-    }
-);
-
-// Homepage: only six closest upcoming events
-app.get("/events/upcoming", getUpcomingEvents);
-app.get("/api/events/upcoming", getUpcomingEvents);
-
-// =====================================================
-// ALL EVENTS
-// =====================================================
-
-// All events for the Upcoming Events page
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+// Public list used by the homepage and /upcoming-events.
 app.get(
-    "/events",
+    '/events',
     asyncHandler(async (req, res) => {
         const db = await getDb();
-
         const events = await db
-            .collection("create_event")
+            .collection('create_event')
             .find({})
-            .sort({ "form.eventDate": 1 })
+            .sort({ _id: -1 })
             .toArray();
 
         res.send(events);
     })
 );
 
+// Alias so both /events and /api/events work.
 app.get(
-    "/api/events",
+    '/api/events',
     asyncHandler(async (req, res) => {
         const db = await getDb();
-
         const events = await db
-            .collection("create_event")
+            .collection('create_event')
             .find({})
-            .sort({ "form.eventDate": 1 })
+            .sort({ _id: -1 })
             .toArray();
 
         res.send(events);
     })
 );
 
-// =====================================================
-// SINGLE EVENT DETAILS
-// =====================================================
-
+// Public event details. Logged-out visitors can view an event before joining.
 app.get(
-    "/events/:id",
+    '/events/:id',
     asyncHandler(async (req, res) => {
         const id = toObjectId(req.params.id);
 
         if (!id) {
-            return res.status(400).send({
-                message: "Invalid event ID.",
-            });
+            return res.status(400).send({ message: 'Invalid event id.' });
         }
 
         const db = await getDb();
-
         const event = await db
-            .collection("create_event")
+            .collection('create_event')
             .findOne({ _id: id });
 
         if (!event) {
-            return res.status(404).send({
-                message: "Event not found.",
-            });
+            return res.status(404).send({ message: 'Event not found.' });
         }
 
         res.send(event);
     })
 );
 
-// =====================================================
-// CREATE EVENT
-// =====================================================
-
-app.post(
-    "/create-event",
-    verifyToken,
-    asyncHandler(async (req, res) => {
-        const body = req.body || {};
-        const form = body.form || body;
-
-        const requiredFields = [
-            "title",
-            "description",
-            "eventType",
-            "imageUrl",
-            "location",
-            "eventDate",
-        ];
-
-        for (const field of requiredFields) {
-            if (
-                typeof form[field] !== "string" ||
-                !form[field].trim()
-            ) {
-                return res.status(400).send({
-                    message: `${field} is required.`,
-                });
-            }
-        }
-
-        const today = getTodayInBangladesh();
-
-        if (
-            !/^\d{4}-\d{2}-\d{2}$/.test(form.eventDate) ||
-            form.eventDate < today ||
-            Number.isNaN(
-                new Date(
-                    `${form.eventDate}T00:00:00Z`
-                ).getTime()
-            )
-        ) {
-            return res.status(400).send({
-                message: "Please select a valid upcoming event date.",
-            });
-        }
-
-        const event = {
-            form: {
-                title: form.title.trim(),
-                description: form.description.trim(),
-                eventType: form.eventType.trim(),
-                imageUrl: form.imageUrl.trim(),
-                location: form.location.trim(),
-                eventDate: form.eventDate,
-                username: req.user?.name || "Community Member",
-                email: req.user?.email,
-            },
-            createdAt: new Date(),
-        };
-
-        const db = await getDb();
-
-        const result = await db
-            .collection("create_event")
-            .insertOne(event);
-
-        res.status(201).send({
-            success: true,
-            message: "Event created successfully.",
-            event: {
-                ...event,
-                _id: result.insertedId,
-            },
-        });
-    })
-);
-
-// =====================================================
-// MY CREATED EVENTS
-// =====================================================
-
+// Public list of people going to an event (used by the event details page).
 app.get(
-    "/api/events/my",
-    verifyToken,
+    '/events/:id/participants',
     asyncHandler(async (req, res) => {
-        const email = req.user?.email;
+        const id = toObjectId(req.params.id);
 
-        if (!email) {
-            return res.status(401).send({
-                message: "Unauthorized!",
-            });
+        if (!id) {
+            return res.status(400).send({ message: 'Invalid event id.' });
         }
 
         const db = await getDb();
+        const joinedEvents = db.collection('joined_events');
 
-        const events = await db
-            .collection("create_event")
+        const records = await joinedEvents
             .find({
-                "form.email": email,
+                $or: [
+                    { eventId: req.params.id },
+                    { eventId: id },
+                ],
             })
-            .sort({ createdAt: -1 })
+            .sort({ _id: 1 })
+            .project({ username: 1, image: 1, email: 1 })
             .toArray();
 
-        res.send(
-            events.map((event) => ({
-                ...flattenEvent(event),
-                form: event.form || {},
-            }))
-        );
-    })
-);
+        // Keep one entry per user even if older duplicate join records exist.
+        const seen = new Set();
+        const participants = [];
 
-// =====================================================
-// UPDATE EVENT
-// =====================================================
-
-app.put(
-    "/api/events/:id",
-    verifyToken,
-    asyncHandler(async (req, res) => {
-        const id = toObjectId(req.params.id);
-
-        if (!id) {
-            return res.status(400).send({
-                message: "Invalid event ID.",
-            });
-        }
-
-        const db = await getDb();
-        const collection = db.collection("create_event");
-
-        const event = await collection.findOne({
-            _id: id,
-        });
-
-        if (!event) {
-            return res.status(404).send({
-                message: "Event not found.",
-            });
-        }
-
-        if (event.form?.email !== req.user?.email) {
-            return res.status(403).send({
-                message: "You cannot edit this event.",
-            });
-        }
-
-        const updates = req.body?.form || req.body;
-        const allowedFields = [
-            "title",
-            "description",
-            "eventType",
-            "imageUrl",
-            "location",
-            "eventDate",
-        ];
-
-        const updatedForm = {
-            ...event.form,
-        };
-
-        for (const field of allowedFields) {
-            if (updates[field] !== undefined) {
-                if (
-                    typeof updates[field] !== "string" ||
-                    !updates[field].trim()
-                ) {
-                    return res.status(400).send({
-                        message: `Invalid ${field}.`,
-                    });
-                }
-
-                updatedForm[field] = updates[field].trim();
-            }
-        }
-
-        if (
-            !/^\d{4}-\d{2}-\d{2}$/.test(updatedForm.eventDate) ||
-            Number.isNaN(
-                new Date(
-                    `${updatedForm.eventDate}T00:00:00Z`
-                ).getTime()
-            )
-        ) {
-            return res.status(400).send({
-                message: "Invalid event date.",
-            });
-        }
-
-        await collection.updateOne(
-            { _id: id },
-            {
-                $set: {
-                    form: updatedForm,
-                    updatedAt: new Date(),
-                },
-            }
-        );
-
-        const updated = await collection.findOne({
-            _id: id,
-        });
-
-        res.send({
-            success: true,
-            event: updated,
-        });
-    })
-);
-
-// =====================================================
-// DELETE EVENT
-// =====================================================
-
-app.delete(
-    "/api/events/:id",
-    verifyToken,
-    asyncHandler(async (req, res) => {
-        const id = toObjectId(req.params.id);
-
-        if (!id) {
-            return res.status(400).send({
-                message: "Invalid event ID.",
-            });
-        }
-
-        const db = await getDb();
-        const events = db.collection("create_event");
-
-        const event = await events.findOne({
-            _id: id,
-        });
-
-        if (!event) {
-            return res.status(404).send({
-                message: "Event not found.",
-            });
-        }
-
-        if (event.form?.email !== req.user?.email) {
-            return res.status(403).send({
-                message: "You cannot delete this event.",
-            });
-        }
-
-        await events.deleteOne({ _id: id });
-
-        await db.collection("joined_events").deleteMany({
-            eventId: id.toString(),
-        });
-
-        res.send({
-            success: true,
-            message: "Event deleted successfully.",
-        });
-    })
-);
-
-// =====================================================
-// EVENT PARTICIPANTS
-// =====================================================
-
-app.get(
-    "/events/:id/participants",
-    asyncHandler(async (req, res) => {
-        const id = toObjectId(req.params.id);
-
-        if (!id) {
-            return res.status(400).send({
-                message: "Invalid event ID.",
-            });
-        }
-
-        const db = await getDb();
-
-        const records = await db
-            .collection("joined_events")
-            .find({
-                eventId: id.toString(),
-            })
-            .project({
-                username: 1,
-                image: 1,
-                email: 1,
-            })
-            .toArray();
-
-        const unique = new Map();
-
-        records.forEach((record) => {
+        for (const record of records) {
             const key = record.email || String(record._id);
 
-            if (!unique.has(key)) {
-                unique.set(key, {
-                    _id: record._id,
-                    username: record.username || "Guest",
-                    image: record.image || null,
-                });
-            }
-        });
+            if (seen.has(key)) continue;
 
-        const participants = Array.from(unique.values());
+            seen.add(key);
+
+            participants.push({
+                _id: record._id,
+                username: record.username || 'Guest',
+                image: record.image || null,
+            });
+        }
 
         res.send({
             registeredCount: participants.length,
@@ -617,18 +280,271 @@ app.get(
     })
 );
 
-// =====================================================
-// JOINED EVENTS
-// =====================================================
-
-// All joined events (public endpoint)
+// Events created by the signed-in user (used by /manage-events).
 app.get(
-    "/joined-events",
+    '/api/events/my',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const email = req.user?.email;
+
+        if (!email) {
+            return res
+                .status(401)
+                .send({ message: 'Unauthorized!' });
+        }
+
+        const db = await getDb();
+        const events = await db
+            .collection('create_event')
+            .find({
+                $or: [
+                    { 'form.email': email },
+                    { email },
+                ],
+            })
+            .sort({ _id: -1 })
+            .toArray();
+
+        res.send(
+            events.map((event) => ({
+                ...flattenEvent(event),
+                form: event.form || event.event || {},
+            }))
+        );
+    })
+);
+
+app.get(
+    '/create-event',
     asyncHandler(async (req, res) => {
         const db = await getDb();
+        const events = await db
+            .collection('create_event')
+            .find({})
+            .sort({ _id: -1 })
+            .toArray();
 
+        res.send(events);
+    })
+);
+
+app.post(
+    '/create-event',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const body = req.body || {};
+        const form = body.form || body;
+
+        if (!form.title || !form.eventDate) {
+            return res.status(400).send({
+                message: 'An event title and date are required.',
+            });
+        }
+
+        const event = {
+            ...body,
+            form: {
+                ...form,
+                // The signed-in user is the organizer. Never trust a
+                // different email sent from the browser.
+                username: form.username || req.user?.name,
+                email: req.user?.email || form.email,
+            },
+            createdAt: new Date(),
+        };
+
+        const db = await getDb();
+        const result = await db
+            .collection('create_event')
+            .insertOne(event);
+
+        res.status(201).send({
+            success: true,
+            event: {
+                ...event,
+                _id: result.insertedId,
+            },
+            insertedId: result.insertedId,
+        });
+    })
+);
+
+// /api create-event alias (front-end calls /api/create-event)
+app.post(
+    '/api/create-event',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const body = req.body || {};
+        const form = body.form || body;
+
+        if (!form.title || !form.eventDate) {
+            return res.status(400).send({
+                message: 'An event title and date are required.',
+            });
+        }
+
+        const event = {
+            ...body,
+            form: {
+                ...form,
+                username: form.username || req.user?.name,
+                email: req.user?.email || form.email,
+            },
+            createdAt: new Date(),
+        };
+
+        const db = await getDb();
+        const result = await db
+            .collection('create_event')
+            .insertOne(event);
+
+        res.status(201).send({
+            success: true,
+            event: {
+                ...event,
+                _id: result.insertedId,
+            },
+            insertedId: result.insertedId,
+        });
+    })
+);
+
+// Update an event (only the organizer can update it).
+app.put(
+    '/api/events/:id',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const id = toObjectId(req.params.id);
+
+        if (!id) {
+            return res.status(400).send({ message: 'Invalid event id.' });
+        }
+
+        const db = await getDb();
+        const events = db.collection('create_event');
+        const event = await events.findOne({ _id: id });
+
+        if (!event) {
+            return res.status(404).send({ message: 'Event not found.' });
+        }
+
+        const ownerEmail =
+            event.form?.email || event.email || null;
+
+        if (
+            ownerEmail &&
+            req.user?.email &&
+            ownerEmail !== req.user.email
+        ) {
+            return res.status(403).send({
+                message: 'You can only edit your own events.',
+            });
+        }
+
+        const body = req.body || {};
+        const updates = body.form || body;
+        const existingForm = event.form || event.event || {};
+
+        if (
+            updates.title !== undefined &&
+            !String(updates.title).trim()
+        ) {
+            return res
+                .status(400)
+                .send({ message: 'Event title is required.' });
+        }
+
+        const allowedFields = [
+            'title',
+            'description',
+            'eventType',
+            'imageUrl',
+            'location',
+            'eventDate',
+        ];
+
+        const form = { ...existingForm };
+
+        for (const field of allowedFields) {
+            if (updates[field] !== undefined) {
+                form[field] = updates[field];
+            }
+        }
+
+        // Keep the original organizer identity.
+        form.username = existingForm.username || event.username;
+        form.email = existingForm.email || event.email;
+        form.createdAt = existingForm.createdAt || event.createdAt;
+
+        await events.updateOne(
+            { _id: id },
+            { $set: { form, updatedAt: new Date() } }
+        );
+
+        const updated = await events.findOne({ _id: id });
+
+        res.send({
+            success: true,
+            event: updated,
+        });
+    })
+);
+
+// Delete an event (only the organizer can delete it).
+app.delete(
+    '/api/events/:id',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const id = toObjectId(req.params.id);
+
+        if (!id) {
+            return res.status(400).send({ message: 'Invalid event id.' });
+        }
+
+        const db = await getDb();
+        const events = db.collection('create_event');
+        const event = await events.findOne({ _id: id });
+
+        if (!event) {
+            return res.status(404).send({ message: 'Event not found.' });
+        }
+
+        const ownerEmail =
+            event.form?.email || event.email || null;
+
+        if (
+            ownerEmail &&
+            req.user?.email &&
+            ownerEmail !== req.user.email
+        ) {
+            return res.status(403).send({
+                message: 'You can only delete your own events.',
+            });
+        }
+
+        await events.deleteOne({ _id: id });
+
+        // Keep the joined records in sync with the deleted event.
+        await db.collection('joined_events').deleteMany({
+            $or: [
+                { eventId: req.params.id },
+                { eventId: new ObjectId(req.params.id) },
+            ],
+        });
+
+        res.send({ success: true, deletedId: req.params.id });
+    })
+);
+
+// ---------------------------------------------------------------------------
+// Joined events
+// ---------------------------------------------------------------------------
+app.get(
+    '/joined-events',
+    asyncHandler(async (req, res) => {
+        const db = await getDb();
         const joined = await db
-            .collection("joined_events")
+            .collection('joined_events')
             .find({})
             .sort({ _id: -1 })
             .toArray();
@@ -637,23 +553,73 @@ app.get(
     })
 );
 
-// User's joined events
+// Details page under /joined-events/[id]. The id can be either the original
+// event id or the id of the joined record.
 app.get(
-    "/joined",
-    verifyToken,
+    '/joined-events/:id',
     asyncHandler(async (req, res) => {
-        const email = req.user?.email;
+        const id = toObjectId(req.params.id);
 
-        if (!email) {
-            return res.status(401).send({
-                message: "Unauthorized!",
-            });
+        if (!id) {
+            return res.status(400).send({ message: 'Invalid event id.' });
         }
 
         const db = await getDb();
+        const events = db.collection('create_event');
+        const joinedEvents = db.collection('joined_events');
 
+        const event = await events.findOne({ _id: id });
+
+        if (event) {
+            const registeredCount = await joinedEvents.countDocuments({
+                $or: [
+                    { eventId: req.params.id },
+                    { eventId: id },
+                ],
+            });
+
+            return res.send({
+                event: {
+                    ...flattenEvent(event),
+                    registeredCount,
+                },
+            });
+        }
+
+        const joined = await joinedEvents.findOne({ _id: id });
+
+        if (!joined) {
+            return res.status(404).send({ message: 'Event not found.' });
+        }
+
+        const form = joined.form || joined.event || {};
+
+        res.send({
+            event: {
+                ...form,
+                _id: joined.eventId || joined._id,
+                registeredCount: 0,
+            },
+        });
+    })
+);
+
+// Joined records for the signed-in user. The frontend passes ?email= as well,
+// but the token is the source of truth.
+app.get(
+    '/joined',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const email =
+            req.user?.email || req.query.email;
+
+        if (!email) {
+            return res.status(401).send({ message: 'Unauthorized!' });
+        }
+
+        const db = await getDb();
         const joined = await db
-            .collection("joined_events")
+            .collection('joined_events')
             .find({ email })
             .sort({ _id: -1 })
             .toArray();
@@ -662,41 +628,29 @@ app.get(
     })
 );
 
-// Join an event
 app.post(
-    "/joined",
+    '/joined',
     verifyToken,
     asyncHandler(async (req, res) => {
-        const eventId = String(
-            req.body?.eventId || ""
-        );
-
-        const id = toObjectId(eventId);
+        const body = req.body || {};
+        const eventId = body.eventId || body.form?._id;
         const email = req.user?.email;
 
-        if (!id || !email) {
-            return res.status(400).send({
-                message: "Valid eventId is required.",
-            });
+        if (!eventId) {
+            return res
+                .status(400)
+                .send({ message: 'eventId is required.' });
+        }
+
+        if (!email) {
+            return res.status(401).send({ message: 'Unauthorized!' });
         }
 
         const db = await getDb();
-
-        const events = db.collection("create_event");
-        const joinedEvents = db.collection("joined_events");
-
-        const event = await events.findOne({
-            _id: id,
-        });
-
-        if (!event) {
-            return res.status(404).send({
-                message: "Event not found.",
-            });
-        }
+        const joinedEvents = db.collection('joined_events');
 
         const existing = await joinedEvents.findOne({
-            eventId,
+            eventId: String(eventId),
             email,
         });
 
@@ -709,48 +663,51 @@ app.post(
         }
 
         const joined = {
-            eventId,
+            username: body.username || req.user?.name,
             email,
-            username: req.user?.name || "Community Member",
-            image: req.user?.image || null,
-            event: event.form,
-            registeringDate: new Date().toISOString(),
+            image: body.image ?? req.user?.image ?? null,
+            eventId: String(eventId),
+            event: body.event || body.form || {},
+            form: body.form || body.event || {},
+            registeringDate:
+                body.registeringDate || new Date().toISOString(),
         };
 
         const result = await joinedEvents.insertOne(joined);
 
         res.status(201).send({
             success: true,
-            joined: {
-                ...joined,
-                _id: result.insertedId,
-            },
+            joined: { ...joined, _id: result.insertedId },
+            insertedId: result.insertedId,
         });
     })
 );
 
-// Leave an event
+// Leave an event.
 app.delete(
-    "/joined/:id",
+    '/joined/:id',
     verifyToken,
     asyncHandler(async (req, res) => {
-        const id = req.params.id;
+        const { id } = req.params;
         const email = req.user?.email;
 
         if (!email) {
-            return res.status(401).send({
-                message: "Unauthorized!",
-            });
+            return res.status(401).send({ message: 'Unauthorized!' });
+        }
+
+        const objectId = toObjectId(id);
+        const filters = [
+            { eventId: id, email },
+        ];
+
+        if (objectId) {
+            filters.push({ _id: objectId, email });
         }
 
         const db = await getDb();
-
         const result = await db
-            .collection("joined_events")
-            .deleteOne({
-                eventId: id,
-                email,
-            });
+            .collection('joined_events')
+            .deleteMany({ $or: filters });
 
         res.send({
             success: true,
@@ -759,29 +716,256 @@ app.delete(
     })
 );
 
-// =====================================================
-// ERROR HANDLING
-// =====================================================
+// ---------------------------------------------------------------------------
+// Newsletter subscription
+// ---------------------------------------------------------------------------
+app.post(
+    '/newsletter',
+    asyncHandler(async (req, res) => {
+        const body = req.body || {};
+        const email = String(body.email || '').trim().toLowerCase();
 
+        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            return res.status(400).send({ message: 'A valid email is required.' });
+        }
+
+        const db = await getDb();
+        const existing = await db
+            .collection('newsletter_subscribers')
+            .findOne({ email });
+
+        if (existing) {
+            return res.send({
+                success: true,
+                alreadySubscribed: true,
+                message: 'You are already subscribed.',
+            });
+        }
+
+        await db.collection('newsletter_subscribers').insertOne({
+            email,
+            source: body.source || 'homepage',
+            subscribedAt: new Date(),
+        });
+
+        res.status(201).send({
+            success: true,
+            alreadySubscribed: false,
+            message: "You're subscribed!",
+        });
+    })
+);
+
+// ---------------------------------------------------------------------------
+// /api prefixed aliases (Vercel rewrites /* to /api; keep both path styles)
+// ---------------------------------------------------------------------------
+app.get(
+    '/api/joined',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const email = req.user?.email || req.query.email;
+
+        if (!email) {
+            return res.status(401).send({ message: 'Unauthorized!' });
+        }
+
+        const db = await getDb();
+        const joined = await db
+            .collection('joined_events')
+            .find({ email })
+            .sort({ _id: -1 })
+            .toArray();
+
+        res.send(joined);
+    })
+);
+
+app.post(
+    '/api/joined',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const body = req.body || {};
+        const eventId = body.eventId || body.form?._id;
+        const email = req.user?.email;
+
+        if (!eventId) {
+            return res.status(400).send({ message: 'eventId is required.' });
+        }
+
+        if (!email) {
+            return res.status(401).send({ message: 'Unauthorized!' });
+        }
+
+        const db = await getDb();
+        const joinedEvents = db.collection('joined_events');
+
+        const existing = await joinedEvents.findOne({
+            eventId: String(eventId),
+            email,
+        });
+
+        if (existing) {
+            return res.send({
+                success: true,
+                alreadyJoined: true,
+                joined: existing,
+            });
+        }
+
+        const joined = {
+            username: body.username || req.user?.name,
+            email,
+            image: body.image ?? req.user?.image ?? null,
+            eventId: String(eventId),
+            event: body.event || body.form || {},
+            form: body.form || body.event || {},
+            registeringDate:
+                body.registeringDate || new Date().toISOString(),
+        };
+
+        const result = await joinedEvents.insertOne(joined);
+
+        res.status(201).send({
+            success: true,
+            joined: { ...joined, _id: result.insertedId },
+            insertedId: result.insertedId,
+        });
+    })
+);
+
+app.delete(
+    '/api/joined/:id',
+    verifyToken,
+    asyncHandler(async (req, res) => {
+        const { id } = req.params;
+        const email = req.user?.email;
+
+        if (!email) {
+            return res.status(401).send({ message: 'Unauthorized!' });
+        }
+
+        const objectId = toObjectId(id);
+        const filters = [{ eventId: id, email }];
+
+        if (objectId) {
+            filters.push({ _id: objectId, email });
+        }
+
+        const db = await getDb();
+        const result = await db
+            .collection('joined_events')
+            .deleteMany({ $or: filters });
+
+        res.send({
+            success: true,
+            deletedCount: result.deletedCount,
+        });
+    })
+);
+
+app.post(
+    '/api/newsletter',
+    asyncHandler(async (req, res) => {
+        const body = req.body || {};
+        const email = String(body.email || '').trim().toLowerCase();
+
+        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            return res.status(400).send({ message: 'A valid email is required.' });
+        }
+
+        const db = await getDb();
+        const existing = await db
+            .collection('newsletter_subscribers')
+            .findOne({ email });
+
+        if (existing) {
+            return res.send({
+                success: true,
+                alreadySubscribed: true,
+                message: 'You are already subscribed.',
+            });
+        }
+
+        await db.collection('newsletter_subscribers').insertOne({
+            email,
+            source: body.source || 'homepage',
+            subscribedAt: new Date(),
+        });
+
+        res.status(201).send({
+            success: true,
+            alreadySubscribed: false,
+            message: "You're subscribed!",
+        });
+    })
+);
+
+app.get(
+    '/api/events/:id',
+    asyncHandler(async (req, res) => {
+        const id = toObjectId(req.params.id);
+
+        if (!id) {
+            return res.status(400).send({ message: 'Invalid event id.' });
+        }
+
+        const db = await getDb();
+        const event = await db
+            .collection('create_event')
+            .findOne({ _id: id });
+
+        if (!event) {
+            return res.status(404).send({ message: 'Event not found.' });
+        }
+
+        res.send(event);
+    })
+);
+
+app.get(
+    '/api/events/:id/participants',
+    asyncHandler(async (req, res) => {
+        const id = toObjectId(req.params.id);
+
+        if (!id) {
+            return res.status(400).send({ message: 'Invalid event id.' });
+        }
+
+        const db = await getDb();
+        const participants = await db
+            .collection('joined_events')
+            .find({ eventId: req.params.id })
+            .sort({ registeringDate: -1 })
+            .toArray();
+
+        res.send({
+            participants,
+            registeredCount: participants.length,
+        });
+    })
+);
+
+// ---------------------------------------------------------------------------
+// 404 + error handling
+// ---------------------------------------------------------------------------
 app.use((req, res) => {
     res.status(404).send({
-        message: "Route not found.",
+        message: 'Route not found.',
         path: req.path,
     });
 });
 
 app.use((error, req, res, next) => {
-    console.error("API Error:", error);
+    console.error('Unhandled API error:', error);
 
     if (res.headersSent) {
         return next(error);
     }
 
     res.status(500).send({
-        success: false,
         message:
-            process.env.NODE_ENV === "production"
-                ? "Internal server error."
+            process.env.NODE_ENV === 'production'
+                ? 'Internal server error.'
                 : error.message,
     });
 });
